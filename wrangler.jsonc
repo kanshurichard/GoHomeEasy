@@ -1,0 +1,15 @@
+{
+  "name": "gohomeeasy",
+  "main": "GoHomeEasy_CF.js",
+  "compatibility_date": "2026-06-25",
+  "kv_namespaces": [
+    {
+      "binding": "KV_NAMESPACE",
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+    }
+  ],
+  "vars": {
+    "SUBSCRIPTION_FORMAT": "ss",
+    "SESSION_TTL_SECONDS": "86400"
+  }
+}

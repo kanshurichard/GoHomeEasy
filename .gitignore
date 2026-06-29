@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+.wrangler/
+.env*
+.dev.vars*
+!.env.example
+!.dev.vars.example
+*.zip
+/gohomeeasy
+/data/
+.cache/
+__pycache__/
+*.pyc

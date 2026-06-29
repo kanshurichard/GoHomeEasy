@@ -1,0 +1,27 @@
+[Unit]
+Description=GoHomeEasy Python self-hosted subscription server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gohomeeasy
+Group=gohomeeasy
+WorkingDirectory=/opt/gohomeeasy
+Environment=READ_TOKEN=replace-with-read-token
+Environment=WRITE_TOKEN=replace-with-write-token
+Environment=SESSION_SECRET=replace-with-long-random-secret
+Environment=SUBSCRIPTION_FORMAT=ss
+Environment=LISTEN_ADDR=127.0.0.1:8080
+Environment=STORAGE_PATH=/var/lib/gohomeeasy/records.json
+ExecStart=/usr/bin/python3 /opt/gohomeeasy/gohomeeasy.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gohomeeasy
+
+[Install]
+WantedBy=multi-user.target

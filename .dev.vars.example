@@ -1,0 +1,6 @@
+READ_TOKEN=replace-with-read-token
+WRITE_TOKEN=replace-with-write-token
+SESSION_SECRET=replace-with-long-random-secret
+SESSION_TTL_SECONDS=86400
+SUBSCRIPTION_FORMAT=ss
+ALLOWED_METHODS=

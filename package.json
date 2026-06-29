@@ -1,0 +1,16 @@
+{
+  "name": "gohomeeasy",
+  "private": true,
+  "type": "module",
+  "description": "Serverless Shadowsocks/Clash subscription updater for home broadband without a public IP.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.883.0",
+    "@aws-sdk/lib-dynamodb": "^3.883.0"
+  }
+}

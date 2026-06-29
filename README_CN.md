@@ -1,219 +1,386 @@
-# 🚀 GoHomeEasy
+# GoHomeEasy
 
-## [English](README.md) | 中文
+GoHomeEasy v2 用来接收 Lucky Webhook，按 `ruleName` 保存多条记录，再按请求实时生成 Shadowsocks 或 Clash 订阅。
 
-**GoHomeEasy** 是一个基于 Serverless (AWS Lambda / Cloudflare Workers) 的 Shadowsocks/Clash 订阅管理工具，专为 **没有公网 IP 的家庭宽带用户** 设计。
+支持的部署方式：
 
-它利用 **Lucky 提供的内网穿透**，结合 Serverless 自动更新订阅，让你可以在 **任何地方（公司、以及手机移动网络）直连访问家庭局域网**，无需手动频繁更换动态 IP 和端口。
+- Cloudflare Workers + KV
+- AWS Lambda + DynamoDB
+- Go 自托管
+- Python 自托管（`gohomeeasy.py` + `dashboard.html`）
 
------
+## v2 行为
 
-## 🌟 **为什么选择 GoHomeEasy？**
+- `ruleName` 必填，会先 `trim`，大小写敏感，最大 128 字节 UTF-8。
+- 重复 `ruleName` 不是报错，而是更新同名记录。
+- 记录类型只支持 `ss` 和 `site`。
+- 不传 `type` 时默认按 `ss` 处理。
+- `type=site` 必须显式声明，而且不能带 `method`、`password`。
+- 只有 `ss` 记录会进入订阅；`site` 只在 Dashboard 里展示。
+- 如果还没有任何 v2 `ss` 记录，系统会继续返回旧版 legacy 订阅内容。
+- Cloudflare KV 和 DynamoDB GSI 读都是最终一致的，写入或删除后短时间内 `/subscription`、`/dashboard`、`/api/records` 可能读到旧值。
 
-✅ **家庭宽带神器**：适合无公网 IP 环境，远程访问 NAS、软路由、PC。
+## 路由
 
-✅ **自动化**：配合 Lucky Webhook，家中 IP 变动后自动更新订阅。
-
-✅ **安全**：支持 API Key 认证，防止恶意扫描。
-
-✅ **无需服务器**：基于 Serverless 架构，免费额度通常足够个人使用。
-
-### 🇨🇳 **中国大陆用户特别推荐**
-
-| 特性 | **AWS Lambda (推荐)** 🏆 | **Cloudflare Workers** |
+| 路由 | 方法 | 作用 |
 | :--- | :--- | :--- |
-| **国内访问** | **✅ 直连 (速度快/稳)** | ❌ `workers.dev` 被墙 (需自备域名优选IP) |
-| **部署难度** | ⭐⭐⭐ (稍繁琐) | ⭐ (极简) |
-| **成本** | **免费** (每月100万次请求) | **免费** (每日10万次请求) |
+| `/` | `POST` | Lucky Webhook |
+| `/webhook` | `POST` | `/` 的别名 |
+| `/?api_key=...` | `GET` | 旧订阅入口；未传 `subtype` 时继续遵守 `SUBSCRIPTION_FORMAT` |
+| `/subscription?subtype=ss|clash&api_key=...` | `GET` | 显式订阅入口 |
+| `/dashboard?api_key=...` | `GET` | 用 token 换签名 cookie，然后跳转到干净的 `/dashboard` |
+| `/api/records` | `GET` | Dashboard 数据接口 |
+| `/api/delete` | `POST` | 按 `ruleName` 删除记录 |
+| `/healthz` | `GET` | 健康检查 |
 
------
+规则：
 
-## ⚙️ **部署前置条件**
+- 两个订阅入口都支持 `Authorization: Bearer READ_TOKEN`，并且优先级高于 `?api_key=`。
+- `?api_key=` 只在 `/`、`/subscription`、`/dashboard` 生效。
+- `/api/*` 永远忽略 query token。
+- `/api/records` 支持 read/write cookie，或 `Authorization: Bearer READ_TOKEN|WRITE_TOKEN`。
+- `/api/delete` 支持 `Authorization: Bearer WRITE_TOKEN`，或者 write-mode cookie + 同源 `Origin`。
+- 如果没配 `SESSION_SECRET`，`/dashboard` 和 `/api/*` 会返回 `500 dashboard not configured`。
 
-1.  **家庭服务器/软路由**：安装 OpenWrt 或 Linux。
-2.  **Shadowsocks 服务端**：推荐 OpenWrt 的 **PassWall2** 或 **Shadowsocks-Libev**。
-3.  **Lucky 内网穿透**：已安装并配置好 STUN 穿透（[Lucky官网](https://lucky666.cn)），能够显示穿透成功。
-4.  **云账号**：
-      * **AWS 账号** (推荐)：用于部署 Lambda。
-      * *或* Cloudflare 账号：用于部署 Workers。
-5.  **客户端**：iOS/MacOS Shadowrocket (小火箭) 或其他支持 SS/Clash 订阅的客户端。
+## Webhook 请求体规则
 
------
+- 地址优先级固定为 `ip` -> `host` -> `server`。
+- 一旦某个非空地址字段被选中，但值非法，就直接 `400`，不会继续 fallback。
+- 只有当 `ip`、`host`、`server` 都为空时，才会使用 `ipAddr`。
+- `ipAddr` 必须是 `host:port` 或 `[ipv6]:port`；使用 `ipAddr` 时会忽略独立 `port` 字段。
+- `time` 如果存在，会原样写入 `sourceTime`。
+- Lucky Webhook 只负责 upsert；改名和删除需要手工处理。
 
-## 💻 **第一步：配置家庭 Shadowsocks 服务器**
-
-*以 OpenWrt Passwall2 为例：*
-
-1.  **添加节点**：在“服务器端”点击“添加”。
-2.  **配置参数**：
-      * **类型**：Shadowsocks (推荐 Sing-Box 核心)。
-      * **监听端口**：`8000` (或其他)。
-      * **加密方式**：推荐 `chacha20-ietf-poly1305`。
-      * **密码**：设置一个强密码。
-      * **局域网访问**：**务必勾选** (允许远程访问家庭内网设备)。
-3.  **保存并启用**。
-
------
-
-## ☁️ **第二步：部署云端订阅服务 (二选一)**
-
-### 🏆 **方案 A：AWS Lambda (国内直连推荐)**
-
-此方案利用 AWS API Gateway + Lambda + DynamoDB，国内网络可直接访问 API，稳定性极佳。
-
-#### **1. 创建 DynamoDB 表 (存储数据)**
-
-1.  登录 [AWS Console](https://console.aws.amazon.com/)，选择一个区域（**推荐新加坡**），搜索并进入 **DynamoDB**。
-2.  点击 **Create table（创建表）**。
-3.  **Table name（表名）**: 输入 `Subscription`。
-4.  **Partition key（分区键）**: 输入 `id` (类型选择 String)。
-5.  其他保持默认，点击 **Create table（创建表）**。
-
-#### **2. 创建 Lambda 函数**
-
-1.  搜索并进入 **Lambda** 服务，请确保此时AWS与刚刚设置数据库时位于同一区域（如新加坡）。
-2.  点击 **Create function（创建函数）** -\> **Author from scratch**。
-3.  **Function name（函数名）**: `GoHomeEasy`。
-4.  **Runtime（运行时）**: 选择 `Node.js 24.x`（或更新的版本）。
-5.  点击 **Create function（创建函数）**。
-
-#### **3. 编写代码 & 安装依赖**
-
-由于 Lambda 需要 AWS SDK，我们直接使用控制台编辑：
-
-1.  在代码源文件列表，将 `index.mjs` 的内容替换为以下代码：
-
-- 如需Shadowsocks格式的订阅——`GoHomeEasy_AWS_SS.js`
-- 如需Clash格式的订阅——`GoHomeEasy_AWS_Clash.js`
-
-2.  点击 **Deploy（部署）** 保存。
-
-#### **4. 配置权限与环境变量**
-
-1.  **环境变量**：
-      * 点击 **Configuration（配置）** -\> **Environment variables（环境变量）** -\> **Edit（编辑）**。
-      * 添加 `SECRET_KEY`: 设置你的 API 密钥（如 `my_secret_123`）。
-      * 添加 `TABLE_NAME`: `Subscription`。
-2.  **IAM 权限**：
-      * 点击 **Configuration（配置）** -\> **Permissions（权限）** -\> 点击 Role 名称。
-      * 在 IAM 控制台，点击 **Add permissions（添加权限）** -\> **Create inline policy（创建内联策略）**。
-      * 选择 Service: **DynamoDB**。
-      * Actions: 勾选 `PutItem` 和 `GetItem`。
-      * Resources: 指定你的表 ARN。
-      * 保存策略。
-
-#### **5. 创建 API 网关 (获取 URL)**
-
-1.  回到 Lambda 页面，点击 **Add trigger**。
-2.  选择 **API Gateway**。
-3.  **Create a new API** -\> **HTTP API**。
-4.  Security: **Open** (我们在代码里验证 Key)。
-5.  创建后，复制 **API Endpoint**，例如：`https://xyz.execute-api.ap-northeast-1.amazonaws.com/default/GoHomeEasy`。
-
------
-
-### **方案 B：Cloudflare Workers (海外用户/已有域名)**
-
-适合中国大陆以外用户，或拥有托管在 Cloudflare 的域名并懂得如何设置路由的中国大陆用户。
-
-1.  登录 **[Cloudflare Dashboard](https://dash.cloudflare.com/)**。
-2.  **创建 KV**：在 `Workers & Pages` -\> `KV` 中创建命名空间 `GoHomeEasy_KV`。
-3.  **创建 Worker**：
-      * 新建 Worker，命名为 `GoHomeEasy`。
-      * 将项目中的 `GoHomeEasy_SS.js` 代码复制进去。
-      * 修改代码中的 `SECRET_KEY`。
-4.  **绑定 KV**：
-      * 在 Worker 设置 -\> **绑定** 中，添加 KV 命名空间。
-      * 变量名: `KV_NAMESPACE`，对应的 KV: `GoHomeEasy_KV`。
-5.  **部署**。
-
------
-
-## 🔗 **第三步：配置 Lucky Webhook**
-
-在 Lucky 后台的 STUN 穿透规则中，开启 **Webhook** 功能。
-
-### **1. Webhook URL (POST)**
-
-根据你的部署方案填写 URL：
-
-  * 🏆 **AWS Lambda 用户**:
-    ```text
-    https://你的API-ID.execute-api.区域.amazonaws.com/default/GoHomeEasy
-    ```
-  * ☁️ **Cloudflare 用户**:
-    ```text
-    https://你的worker名.你的子域.workers.dev/
-    ```
-
-### **2. Request Headers (请求头)**
-
-```text
-Content-Type: application/json
-Authorization: Bearer 你的SECRET_KEY
-```
-
-### **3. Request Body (请求体)**
-
-Lucky 会自动替换 `#{ip}` 和 `#{port}` 变量。
+Shadowsocks 记录示例：
 
 ```json
 {
+  "ruleName": "Home-SS",
   "ip": "#{ip}",
   "port": "#{port}",
   "method": "chacha20-ietf-poly1305",
-  "password": "你的Shadowsocks密码"
+  "password": "replace-with-password"
 }
 ```
 
-> **注意**：`method` 和 `password` 必须与你在 Passwall 中设置的一致。
+Site 记录示例：
 
------
+```json
+{
+  "ruleName": "Home-NAS",
+  "type": "site",
+  "host": "nas.example.com",
+  "port": 443,
+  "time": "#{time}"
+}
+```
 
-## 📥 **第四步：客户端订阅 (Shadowrocket)**
+## Webhook 必填字段
 
-以 iOS 小火箭为例，添加订阅链接，实现自动同步家中 IP。
+| 记录类型 | 必填字段 | 可选字段 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `ss` | `ruleName`、一组地址来源、`method`、`password` | `type`、`time` | `type` 可以不传，默认就是 `ss` |
+| `site` | `ruleName`、`type=site`、一组地址来源 | `time` | 不能带 `method`、`password` |
 
-### **1. 添加订阅**
+地址来源四选一：
 
-点击右上角 `+`，类型选择 **Subscribe (订阅)**，URL 填入：
+- `ip` + `port`
+- `host` + `port`
+- `server` + `port`
+- `ipAddr`，格式必须是 `host:port` 或 `[ipv6]:port`
 
-  * 🏆 **AWS Lambda 用户**:
-    ```text
-    https://你的API-ID...amazonaws.com/default/GoHomeEasy?api_key=你的SECRET_KEY
-    ```
-  * ☁️ **Cloudflare 用户**:
-    ```text
-    https://你的worker...workers.dev/?api_key=你的SECRET_KEY
-    ```
+补充说明：
 
-### **2. 设置分流规则 (关键)**
+- 想更新已有记录时，直接复用同一个 `ruleName`
+- 想只在 Dashboard 展示时，显式传 `type=site`
+- 想在 Dashboard 里保留 Lucky 原始时间时，再附带 `time`
 
-为了只在访问家庭内网时使用此节点，避免影响日常上网：
+## 配置项
 
-1.  进入 **配置** -\> **规则**。
-2.  添加一条新规则（放在最顶部）：
-      * **类型**: `IP-CIDR`
-      * **值**: `192.168.1.0/24` (请根据你家路由器的实际网段修改，如 192.168.31.0/24)
-      * **策略**: 选择 `GoHomeEasy` (刚刚添加的订阅节点组)
-3.  **保存**。
+| 变量 | 必填 | 作用 |
+| :--- | :--- | :--- |
+| `READ_TOKEN` | 是 | 订阅读取和只读 Dashboard 登录 |
+| `WRITE_TOKEN` | 是 | Lucky Webhook 写入和删除操作 |
+| `SESSION_SECRET` | Dashboard/API 必填 | 用来签名 Dashboard cookie 的 HMAC 密钥 |
+| `SESSION_TTL_SECONDS` | 否 | Dashboard cookie 有效期，默认 `86400` |
+| `SUBSCRIPTION_FORMAT` | 否 | 旧根路径 `GET /` 的默认输出格式，默认 `ss` |
+| `ALLOWED_METHODS` | 否 | 覆盖默认的 Shadowsocks cipher 白名单 |
+| `TABLE_NAME` | 仅 AWS | DynamoDB 表名 |
+| `RECORD_INDEX_NAME` | 仅 AWS | GSI 名称，默认 `RecordIndex` |
+| `LISTEN_ADDR` | 仅 Go/Python | 监听地址，默认 `127.0.0.1:8080` |
+| `STORAGE_PATH` | 仅 Go/Python | 本地 JSON 文档路径，默认 `./data/records.json` |
+| `KV_NAMESPACE` | 仅 Workers | `wrangler.jsonc` 里的 KV 绑定名 |
 
-### **3. 解决同网段冲突 (可选)**
+## 本地校验
 
-如果你在外部的网络也是 `192.168.1.x`，可能会无法连接回家。建议：
+先跑完整自动化测试：
 
-  * **方法一 (推荐)**：修改家中路由器的网段为不常用的，如 `192.168.50.x`。
-  * **方法二**：在 Shadowrocket 设置 -\> **按需连接** -\> 开启 **包括本地网络**。
+```bash
+make test
+```
 
------
+也可以按语言分别执行：
 
-## 🛡 **常见问题**
+```bash
+npm install
+npm test
+go test ./...
+python3 -m unittest discover -s pytests -p 'test_*.py' -v
+```
 
-**Q: AWS 会产生费用吗？**
-A: AWS Lambda 每月有 40万GB-秒的计算额度和 100万次请求免费额度；DynamoDB 也有 25GB 的免费存储。对于个人自用（仅更新和获取订阅），基本**永久免费**。
+## 调用示例
 
-**Q: 为什么 Lucky 显示 Webhook 成功，但订阅没更新？**
-A: 请检查 Lambda/Worker 的日志。常见原因是 `SECRET_KEY` 不匹配，或者 AWS IAM 权限没配置好（导致无法写入 DynamoDB）。
+新增或更新一个 Shadowsocks 记录：
 
-**Q: 在外面无法连接回家？**
-A: 请确保家里的 Lucky STUN 穿透类型是 TCP，并且获取到了正确的公网 IP。如果外部司网络屏蔽了非标准端口（如 STUN 的高位端口），可能需要尝试 Lucky 的端口映射功能或更换端口。
+```bash
+curl -X POST 'https://你的地址/webhook' \
+  -H 'Authorization: Bearer WRITE_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ruleName": "Home-SS",
+    "host": "edge.example.com",
+    "port": 443,
+    "method": "aes-256-gcm",
+    "password": "replace-with-password"
+  }'
+```
+
+新增一个只在 Dashboard 展示的 `site` 记录：
+
+```bash
+curl -X POST 'https://你的地址/webhook' \
+  -H 'Authorization: Bearer WRITE_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ruleName": "Home-NAS",
+    "type": "site",
+    "host": "nas.example.com",
+    "port": 443
+  }'
+```
+
+获取订阅：
+
+```bash
+curl 'https://你的地址/subscription?subtype=ss&api_key=READ_TOKEN'
+curl 'https://你的地址/subscription?subtype=clash&api_key=READ_TOKEN'
+curl -H 'Authorization: Bearer READ_TOKEN' 'https://你的地址/'
+```
+
+不打开 Dashboard 页面，直接读记录接口：
+
+```bash
+curl -H 'Authorization: Bearer READ_TOKEN' \
+  'https://你的地址/api/records'
+```
+
+按 `ruleName` 删除记录：
+
+```bash
+curl -X POST 'https://你的地址/api/delete' \
+  -H 'Authorization: Bearer WRITE_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"ruleName":"Home-SS"}'
+```
+
+## Cloudflare Workers
+
+v2 主要面向 Workers 部署。
+
+1. 安装依赖：
+
+```bash
+npm install
+```
+
+2. 创建 KV namespace，并把 id 填到 [`wrangler.jsonc`](wrangler.jsonc)。
+
+3. 设置必需 secrets：
+
+```bash
+npx wrangler secret put READ_TOKEN
+npx wrangler secret put WRITE_TOKEN
+npx wrangler secret put SESSION_SECRET
+```
+
+4. 调整 [`wrangler.jsonc`](wrangler.jsonc)：
+
+- `main: "GoHomeEasy_CF.js"` 时由 `SUBSCRIPTION_FORMAT` 控制旧根路径默认格式
+- `GoHomeEasy_CF_SS.js` 和 `GoHomeEasy_CF_Clash.js` 是固定格式兼容入口
+- `SESSION_TTL_SECONDS` 可选
+
+5. 部署：
+
+```bash
+npx wrangler deploy
+```
+
+已知限制：
+
+- KV 在不同 PoP 之间是最终一致的，更新或删除后短时间内其他地区可能仍看到旧记录。
+
+## AWS Lambda + DynamoDB
+
+1. 安装依赖：
+
+```bash
+npm install
+```
+
+2. 创建 DynamoDB 表：
+
+- 表名：`Subscription` 或你自己的名字
+- 主键：`id`，类型 `String`
+
+3. 给 v2 记录增加 GSI：
+
+- 索引名：`RecordIndex` 或你自己的名字
+- 分区键：`gsi1pk`，类型 `String`
+- 排序键：`gsi1sk`，类型 `String`
+
+4. 打包 Lambda：
+
+```bash
+zip -r gohomeeasy-aws.zip GoHomeEasy_AWS.js GoHomeEasy_AWS_SS.js GoHomeEasy_AWS_Clash.js src package.json package-lock.json node_modules
+```
+
+5. 配置环境变量：
+
+- `READ_TOKEN`
+- `WRITE_TOKEN`
+- `SESSION_SECRET`
+- `TABLE_NAME=Subscription`
+- 如果索引名不是默认值，再加 `RECORD_INDEX_NAME=RecordIndex`
+- 使用 `GoHomeEasy_AWS.js` 时，再加 `SUBSCRIPTION_FORMAT=ss` 或 `clash`
+
+6. 配置 Handler：
+
+- `GoHomeEasy_AWS.handler`
+- `GoHomeEasy_AWS_SS.handler`
+- `GoHomeEasy_AWS_Clash.handler`
+
+7. 给 Lambda 执行角色授权：
+
+- `dynamodb:GetItem`
+- `dynamodb:PutItem`
+- `dynamodb:DeleteItem`
+- `dynamodb:Query`
+
+8. 通过 API Gateway HTTP API 暴露函数。
+
+已知限制：
+
+- DynamoDB GSI 查询也是最终一致的，刚写入或刚删除的记录不一定能立刻读到。
+
+## Go 自托管
+
+1. 编译：
+
+```bash
+go build -o gohomeeasy ./cmd/gohomeeasy
+```
+
+2. 配置环境变量：
+
+```bash
+export READ_TOKEN=replace-with-read-token
+export WRITE_TOKEN=replace-with-write-token
+export SESSION_SECRET=replace-with-long-random-secret
+export SUBSCRIPTION_FORMAT=ss
+export LISTEN_ADDR=127.0.0.1:8080
+export STORAGE_PATH=/var/lib/gohomeeasy/records.json
+```
+
+3. 启动：
+
+```bash
+./gohomeeasy
+```
+
+4. 如需 TLS 和域名，前面挂 Nginx 或 Caddy。
+
+5. 仓库里带了一个 [`gohomeeasy.service`](gohomeeasy.service) 作为 `systemd` 示例。
+
+6. 如果你用 Nginx，可以直接从 [`deploy/nginx-gohomeeasy.conf.example`](deploy/nginx-gohomeeasy.conf.example) 改起。`Host` 和 `X-Forwarded-Proto` 这些转发头是必须的，否则 Dashboard 的同源校验和安全 Cookie 会出问题。
+
+## Python 自托管
+
+这条路径不依赖 Node.js，也不需要额外 Python 包。
+
+1. 配置环境变量：
+
+```bash
+export READ_TOKEN=replace-with-read-token
+export WRITE_TOKEN=replace-with-write-token
+export SESSION_SECRET=replace-with-long-random-secret
+export SUBSCRIPTION_FORMAT=ss
+export LISTEN_ADDR=127.0.0.1:8080
+export STORAGE_PATH=/var/lib/gohomeeasy/records.json
+```
+
+2. 启动：
+
+```bash
+python3 gohomeeasy.py
+```
+
+3. 保证 [`dashboard.html`](dashboard.html) 和 [`gohomeeasy.py`](gohomeeasy.py) 在同一目录。
+
+4. 仓库里带了一个 [`gohomeeasy-python.service`](gohomeeasy-python.service) 作为 Python 版 `systemd` 示例。
+
+5. 如果你用 Nginx，也可以直接参考 [`deploy/nginx-gohomeeasy.conf.example`](deploy/nginx-gohomeeasy.conf.example)。
+
+## Go/Python 反代说明
+
+- 建议在 Nginx 或 Caddy 上终止 TLS，再反代到 `127.0.0.1:8080`。
+- 必须转发 `Host`、`X-Forwarded-Host`、`X-Forwarded-Proto`。
+- 少了这些头，Dashboard 的同源判断和 `Secure` Cookie 行为都会不对。
+
+## 部署后 smoke test
+
+每次部署或改配置后，建议直接跑仓库自带脚本：
+
+```bash
+./scripts/smoke-test.sh https://你的地址 READ_TOKEN WRITE_TOKEN
+```
+
+或者通过 Makefile：
+
+```bash
+make smoke ENDPOINT=https://你的地址 READ_TOKEN=... WRITE_TOKEN=...
+```
+
+这个 smoke test 会检查：
+
+- `/healthz`
+- webhook 写入
+- SS 和 Clash 订阅输出
+- `/api/records`
+- Dashboard 登录跳转
+- `/api/delete` 清理
+
+## 订阅地址
+
+- 兼容旧根路径：`GET /?api_key=READ_TOKEN`
+- 显式 SS：`GET /subscription?subtype=ss&api_key=READ_TOKEN`
+- 显式 Clash：`GET /subscription?subtype=clash&api_key=READ_TOKEN`
+- 也支持 header：`Authorization: Bearer READ_TOKEN`
+
+保留旧根路径的意义是：没有 `subtype` 的老客户端仍会继续遵守 `SUBSCRIPTION_FORMAT`。
+
+## Dashboard
+
+Dashboard 是一个无构建步骤的静态 HTML 页面。
+
+- 展示 SS 和 Clash 两条订阅链接
+- 同时列出 `ss` 与 `site` 记录
+- 密码默认隐藏，可在浏览器中点开
+- 只读模式下禁用删除按钮
+- 当还没有 v2 `ss` 记录时，会显示 legacy fallback 提示
+
+## 说明
+
+- 订阅输出会按 `ruleName` 升序排列，保证稳定。
+- `site` 永远不会进入订阅。
+- 如果既没有 v2 `ss` 记录，也没有 legacy 内容，订阅接口返回 `204`。
+- 旧版本地“纯字符串订阅文件”在首次读取时会被当成 legacy 内容处理，升级后不会立刻把现有订阅清空。
